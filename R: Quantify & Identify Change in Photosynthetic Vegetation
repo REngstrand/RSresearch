@@ -1,0 +1,129 @@
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+
+pv=read.csv("C:/Users/rache/OneDrive/Documents/EIPER/DATA/Mining Revisitation/miningpts.csv", header = TRUE)
+
+#convert -9999 to NAs using dplyr
+pv2=na_if(pv, -9999)
+pv=na_if(pv2, 0)
+
+#want ratio of signal and noise for PV so that we dont use super shitty values in our calculations
+error=pv[c(1:978530),c(50:84)]/pv[c(1:978530),c(15:49)]
+pvs=pv[c(1:978530),c(14:49)]
+
+#make PV values NA if error is too high
+pvs[error>=0.4]<- NA
+pvs
+
+test=pv[c(1:978530),c(15:49)]
+#calculate differences in PV values, ignoring NAs
+d_pv=pmap_dfr(pvs, ~ {
+   x <- c(...)
+  i1 <- !is.na(x)
+  diff(x[i1]) %>% 
+  as.list}) %>%
+  select(sort(names(.)))
+dpv=d_pv[,c(2:35)]
+head(pvs)
+#want rate of change not magnitude of change
+#d_pv(Y2Y1)/pvY2
+df1=pvs[,c(3:36)] #making DFs equal size so the division works, 1984 drops out for dDF
+rpv=dpv/df1
+
+
+
+#want to mark all the times where %PV decreases by <= 10
+#classify as 1 if decreased
+
+df4=rpv
+df4[df4>-0.1]<-0
+df4[df4<0]<-1
+cpv=df4
+cpv[is.na(cpv)]<-0.7
+
+df4=rpv
+df4[df4>-0.08]<-0
+df4[df4<0]<-1
+cpv2=df4
+cpv2[is.na(cpv2)]<-0.7
+
+df4=rpv
+df4[df4>-0.15]<-0
+df4[df4<0]<-1
+cpv3=df4
+cpv3[is.na(cpv3)]<-0.7
+
+#try to merge rate and classified PV into original df
+pv_new<-pv[c(1:978530),-c(15:119)]
+
+clas_pvd_low<-cbind(pv_new, cpv2)
+clas_pvd_mid<-cbind(pv_new, cpv)
+clas_pvd_high<-cbind(pv_new, cpv3)
+
+rate_pv<-cbind(pv_new, rpv)
+
+#get year of last visit
+clas_pvd_high$last=colnames(clas_pvd_high[,15:48])[max.col(clas_pvd_high[,15:48],ties.method="last")]
+clas_pvd_mid$last=colnames(clas_pvd_mid[,15:48])[max.col(clas_pvd_mid[,15:48],ties.method="last")]
+clas_pvd_low$last=colnames(clas_pvd_low[,15:48])[max.col(clas_pvd_low[,15:48],ties.method="last")]
+
+clas_pvd_high=na_if(clas_pvd_high, 0.7)
+clas_pvd_mid=na_if(clas_pvd_mid, 0.7)
+clas_pvd_low=na_if(clas_pvd_low, 0.7)
+
+#get number of visists of all time
+clas_pvd_high$predvisits=rowSums(clas_pvd_high[,15:48], na.rm=TRUE)
+clas_pvd_mid$predvisits=rowSums(clas_pvd_mid[,15:48], na.rm=TRUE)
+clas_pvd_low$predvisits=rowSums(clas_pvd_low[,15:48], na.rm=TRUE)
+
+#get number of visits including and since first visit
+sumH <- clas_pvd_high %>%
+  pivot_longer(-c(1:15,50,51), names_to="Years", values_to="Present") %>%
+  group_by(POINTID) %>%
+  filter(Years >= yr_raster) %>%
+  summarize(
+    Visits = sum(Present, na.rm = TRUE))
+  
+sumM <- clas_pvd_mid %>%
+  pivot_longer(-c(1:14,49:51), names_to="Years", values_to="Present") %>%
+  group_by(POINTID) %>%
+  filter(Years >= yr_raster) %>%
+  summarize(
+    Visits = sum(Present, na.rm = TRUE))
+
+sumL <- clas_pvd_low %>%
+  pivot_longer(-c(1:14,49:51), names_to="Years", values_to="Present") %>%
+  group_by(POINTID) %>%
+  filter(Years >= yr_raster) %>%
+  summarize(
+    Visits = sum(Present, na.rm = TRUE))
+
+clas_pvd_high=inner_join(clas_pvd_high, sumH, by = "POINTID")
+clas_pvd_mid=inner_join(clas_pvd_mid, sumM, by = "POINTID")
+clas_pvd_low=inner_join(clas_pvd_low, sumL, by = "POINTID")
+
+#export to use in ArcGIS
+write.csv(clas_pvd_high, "C:/Users/rache/OneDrive/Documents/EIPER/DATA/Mining Revisitation/clas_pvd_high.csv")
+write.csv(clas_pvd_mid, "C:/Users/rache/OneDrive/Documents/EIPER/DATA/Mining Revisitation/clas_pvd_mid.csv")
+write.csv(clas_pvd_low, "C:/Users/rache/OneDrive/Documents/EIPER/DATA/Mining Revisitation/clas_pvd_low.csv")
+
+#want to make a revisit ranked dataset
+high=clas_pvd_high[,c(16:49)]
+mid=clas_pvd_mid[,c(15:48)]
+low=clas_pvd_low[,c(15:48)]
+low[high>0]<- 3
+
+extract=clas_pvd_low[,c(1:14)]
+
+clas_pvd_combo=cbind(extract, low)
+
+clas_pvd_combo$lasthigh=clas_pvd_high$last
+clas_pvd_combo$lastmid=clas_pvd_mid$last
+clas_pvd_combo$lastlow=clas_pvd_low$last 
+
+clas_pvd_combo$visithigh=clas_pvd_high$Visits
+clas_pvd_combo$visitmid=clas_pvd_mid$Visits
+clas_pvd_combo$visitlow=clas_pvd_low$Visits
+write.csv(clas_pvd_combo, "C:/Users/rache/OneDrive/Documents/EIPER/DATA/Mining Revisitation/clas_pvd_combo.csv")
