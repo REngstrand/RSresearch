@@ -1,0 +1,217 @@
+
+Map.centerObject(roi, 9)  
+var jsonCoordString = roi.toGeoJSON();
+for (var start_year = 1984; start_year <= 2011; start_year++) {
+  var startDate = ee.Date.fromYMD(start_year,01,01);
+  var collection = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+    .filter(ee.Filter.bounds(roi))
+    .filter(ee.Filter.calendarRange(1, 12, 'month'))
+    .filter(ee.Filter.date(startDate, startDate.advance(1,'year')))
+    
+  var mosaic = toMosaic({
+    collection: collection, 
+    cloudThreshold: 0.2, 
+    hazeThreshold: 0.2,
+    cloudBufferMeters: 0
+  })
+  var visParams = {bands: 'B3,B2,B1', min: 200, max: 2000, gamma: 1.5}
+  // var visParams = {bands: 'swir2,nir,red', min: [100, 500, 300], max: [2000, 6000, 2500]}
+  Map.addLayer(mosaic, visParams, 'puerto' + start_year);
+  
+  Export.image.toDrive({image: mosaic.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']),
+                       description: 'puerto_YEAR_' + start_year + '_x_' + start_year.toString(),
+                       folder: 'puerto_improved_expandedarea_2',
+                       fileNamePrefix: 'puerto_' + start_year.toString(),
+                       region: jsonCoordString,
+                       crs: 'EPSG:32719',
+                       maxPixels: 10000000000,
+                       scale: 30})
+                       
+}
+
+function toMosaic(params) {
+  if (!params || !params.collection) 
+    throw Error('Params object must contain a collection')
+    
+  var collection = params.collection
+  var cloudThreshold = 'cloudThreshold' in params 
+    ? params.cloudThreshold : 0.2
+  var hazeThreshold = 'hazeThreshold' in params
+    ? params.hazeThreshold : 0.2
+  var cloudBufferMeters = 'cloudBufferMeters' in params
+    ? params.cloudBufferMeters : 600
+  return maskHaze(
+      maskShadows(
+        preProcess(collection)
+      )
+    )
+    .median()
+    .clip(roi)
+        
+  function preProcess(collection) {
+    return collection
+    .map(function(image) {
+      return maskImage(
+        image
+          .addBands(calculateShadowScore(image))
+          .addBands(calculateHazeScore(image))
+          .addBands(calculateCloudScore(image))
+      )
+    })
+  }
+  
+  function maskShadows(collection) {
+    var shadowScoreThreshold = collection
+      .select('shadowScore')
+      .median()
+      .multiply(0.75)
+    return collection.map(function (image) {
+      return image.updateMask(
+        image.select('shadowScore').gte(shadowScoreThreshold)
+      )
+    })
+  }
+  
+  function maskHaze(collection) {
+    var hazeScoreThreshold = collection
+      .select('hazeScore')
+      .min()
+      .add(0.1)
+      .min(hazeThreshold)
+    return collection
+      .map(function(image) {
+        return image.updateMask(
+          image.select('hazeScore').lte(hazeScoreThreshold)
+        )
+      })    
+  }
+
+  function maskImage(image) {
+    var opacity = image.select('sr_atmos_opacity')
+    var cloudScore = image.select('cloudScore')
+    var qa = image.select('pixel_qa')
+    var clear = bitwiseExtract(qa, 1)
+    var water = bitwiseExtract(qa, 2)
+    var cloud = bitwiseExtract(qa, 5)
+      .or(cloudScore.gt(cloudThreshold))
+    return image.updateMask(
+      clear.or(water)
+        .and(bufferClouds(cloud, cloudBufferMeters).not())
+        .and(opacity.lt(250))
+    )
+  }
+  
+  function bufferClouds(cloud, meters) {
+    if (!meters)
+      return cloud
+    var minCloudDistance = 50
+
+    // Clouds with radius < minCloudDistance will not have any inner pixels, and will not get buffered
+    var innerPixel = cloud.not()
+        .fastDistanceTransform(256, 'pixels').sqrt()
+        .multiply(ee.Image.pixelArea().sqrt())
+        .gt(minCloudDistance)
+        .and(cloud)
+
+    var distanceToInnerPixel = innerPixel
+        .fastDistanceTransform(256, 'pixels').sqrt()
+        .multiply(ee.Image.pixelArea().sqrt())
+
+    return distanceToInnerPixel
+        .lt(ee.Number(meters).add(minCloudDistance))
+        .or(cloud)
+        .rename('cloud')
+  }  
+  
+  function calculateShadowScore(image) {
+    return image.expression(
+      'sqrt((pow(i.B2, 2) + pow(i.B3, 2) + pow(i.B4, 2)) / 3)',
+      {i: image}
+    ).rename('shadowScore')  
+  }
+  
+  function calculateCloudScore(image) {
+    // Based on scripts by Ian Hausman, which in turn is based on script by Matt Hancher
+    // https://groups.google.com/d/msg/google-earth-engine-developers/i63DS-Dg8Sg/_hgCBEYeBwAJ  
+    image = image.divide(10000).float()
+    var score = ee.Image(1)
+    var blueCirrusScore = ee.Image(0)
+  
+    // Clouds are reasonably bright in the blue or cirrus bands.
+    // Use .max as a pseudo OR conditional
+    blueCirrusScore = blueCirrusScore.max(unitScale(image.select('B1'), 0.1, 0.5))
+    score = score.min(blueCirrusScore)
+  
+    // Clouds are reasonably bright in all visible bands.
+    score = score.min(
+      unitScale(image.expression('i.B3 + i.B2 + i.B1', {
+        i: image
+      }), 0.2, 0.8)
+    )
+  
+    // Clouds are reasonably bright in all infrared bands.
+    score = score.min(
+      unitScale(image.expression('i.B4 + i.B5 + i.B7', {
+        i: image
+      }), 0.3, 0.8)
+    )
+  
+    // However, clouds are not snow.
+    var ndsi = image.normalizedDifference(['B2', 'B5'])
+    score = score.min(
+      unitScale(ndsi, 0.8, 0.6)
+    )
+    return score.rename('cloudScore')
+  }
+  
+  function calculateHazeScore(image) {
+    var ndvi = image.normalizedDifference(['B4', 'B3'])
+    var ndsi = image.normalizedDifference(['B2', 'B5'])
+    var meanVis = image.expression(
+      '(i.B1 + i.B2 + i.B3) / 3', {
+        i: image
+      }
+    )
+    var whiteness = image.expression(
+      '(abs(i.B1 - meanVis) + abs(i.B2 - meanVis) + abs(i.B3 - meanVis)) / meanVis', {
+        i: image,
+        meanVis: meanVis
+      }
+    )
+  
+    var variabilityProb = image.expression(
+      '1 - max(max(abs(ndvi), abs(ndsi)), whiteness)', {
+        i: image,
+        ndvi: ndvi,
+        ndsi: ndsi,
+        whiteness: whiteness
+      }
+    ).clamp(0, 1).rename('variabilityProb')
+    
+    var hazeProb = image.expression(
+      '10 * (i.B1/10000 - 0.5 * i.B3/10000 - 0.06) + 0.5', {
+        i: image
+      }
+    ).clamp(0, 1)
+  
+    return image.expression(
+      'min(variabilityProb, hazeProb)', 
+      {variabilityProb: variabilityProb, hazeProb: hazeProb}
+    ).rename('hazeScore')
+  }
+  
+  function unitScale(image, low, high) {
+    return image
+      .subtract(low)
+      .divide(ee.Number(high).subtract(ee.Number(low)))
+      .clamp(0, 1)
+  }
+  
+  function bitwiseExtract(value, fromBit, toBit) {
+    if (toBit === undefined)
+      toBit = fromBit
+    var maskSize = ee.Number(1).add(toBit).subtract(fromBit)
+    var mask = ee.Number(1).leftShift(maskSize).subtract(1)
+    return value.rightShift(fromBit).bitwiseAnd(mask)
+  }
+}
